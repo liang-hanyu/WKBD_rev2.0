@@ -40,6 +40,8 @@ if sys.stderr is None:
     sys.stderr = sys.stdout
 
 IS_WIN = (os.name == "nt")
+IS_MAC = (platform.system() == "Darwin")
+IS_LINUX = (not IS_WIN and not IS_MAC)
 
 # ------------------------------------------------- 静默子进程：一律不弹控制台窗口
 # pythonw.exe 自身没有控制台，它派生的 cmd / powershell / schtasks 会被系统
@@ -660,7 +662,8 @@ def _npm_env():
     env["npm_config_update_notifier"] = "false"
     env["npm_config_fund"] = "false"
     env["npm_config_audit"] = "false"
-    tmp = env.get("TEMP") or env.get("TMP") or os.path.join(os.path.expanduser("~"), ".cache")
+    import tempfile as _tf
+    tmp = env.get("TEMP") or env.get("TMP") or env.get("TMPDIR") or _tf.gettempdir()
     env["npm_config_cache"] = os.path.join(tmp, "forge-npm-probe")
     return env
 
@@ -866,7 +869,27 @@ def pick_directory(title="选择目录", initialdir=""):
     except Exception:
         pass
 
-    # ---- 方案二：PowerShell FolderBrowserDialog ----
+    # ---- 方案二：macOS osascript（原生目录选择） ----
+    if IS_MAC:
+        try:
+            # choose folder 返回 POSIX path；标题里含双引号会破坏 AppleScript，替成单引号
+            safe_title = title.replace('"', "'")
+            safe_init = init.replace('"', "'")
+            scpt = ('tell application "SystemUIServer"\n'
+                    '  activate\n'
+                    '  set v to choose folder with prompt "%s" default location POSIX file "%s"\n'
+                    '  return POSIX path of v\n'
+                    'end tell' % (safe_title, safe_init))
+            r = subprocess.run(["osascript", "-e", scpt],
+                               capture_output=True, timeout=600)
+            out = (r.stdout or b"").decode("utf-8", "replace").strip()
+            if out:
+                return os.path.normpath(out)
+        except Exception:
+            pass
+        return ""
+
+    # ---- 方案三：PowerShell FolderBrowserDialog（Windows） ----
     if IS_WIN:
         try:
             ps = ("Add-Type -AssemblyName System.Windows.Forms | Out-Null;"
@@ -1069,12 +1092,42 @@ def loose_state(text, want_hash=""):
 
 TPL_PROBE = os.path.join("resources", "app.asar.unpacked", "resources", "templates", "workbuddy-prompt.tpl")
 
-TASK_HOURLY = "WorkBuddyUnlockV6_Hourly"
-TASK_LOGON = "WorkBuddyUnlockV6_Logon"
-ALL_TASKS = ["WorkBuddyUnlockGuard", "WorkBuddyUnlockGuard_Hourly",
-             "WorkBuddyUnlockV3", "WorkBuddyUnlockV4",
-             "WorkBuddyUnlockV4_Hourly", "WorkBuddyUnlockV4_Logon",
-             "WorkBuddyUnlockV6_Hourly", "WorkBuddyUnlockV6_Logon"]
+# macOS：Electron 应用包成 .app bundle，资源根是 WorkBuddy.app/Contents/Resources；
+# Windows：安装根下直接是 resources。这个助手把"安装根"翻译成"app.asar.unpacked 所在层"。
+def _app_root(install):
+    if not install:
+        return ""
+    if IS_MAC:
+        # 用户给的可能是 WorkBuddy.app 本身，也可能是 Contents 那一层 —— 都兜住
+        if os.path.basename(install) == "Contents" and os.path.isdir(os.path.join(install, "Resources")):
+            return os.path.join(install, "Resources")
+        return os.path.join(install, "Contents", "Resources")
+    return os.path.join(install, "resources")
+
+def _tpl_probe_path(install):
+    return os.path.join(_app_root(install), "app.asar.unpacked", "resources", "templates", "workbuddy-prompt.tpl")
+
+def _exe_name():
+    # Windows: WorkBuddy.exe；macOS: WorkBuddy.app（bundle）
+    return "WorkBuddy.app" if IS_MAC else "WorkBuddy.exe"
+
+def _xml_escape(s):
+    """plist 字符串转义：& < >。路径里不会出现 &，但稳妥起见全转。"""
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+if IS_MAC:
+    # launchd：用户级 LaunchAgent，标签 com.workbuddy.forge.*
+    TASK_HOURLY = "com.workbuddy.forge.hourly"
+    TASK_LOGON = "com.workbuddy.forge.login"
+    ALL_TASKS = [TASK_HOURLY, TASK_LOGON,
+                 "com.workbuddy.forge.v4.hourly", "com.workbuddy.forge.v4.login"]
+else:
+    TASK_HOURLY = "WorkBuddyUnlockV6_Hourly"
+    TASK_LOGON = "WorkBuddyUnlockV6_Logon"
+    ALL_TASKS = ["WorkBuddyUnlockGuard", "WorkBuddyUnlockGuard_Hourly",
+                 "WorkBuddyUnlockV3", "WorkBuddyUnlockV4",
+                 "WorkBuddyUnlockV4_Hourly", "WorkBuddyUnlockV4_Logon",
+                 "WorkBuddyUnlockV6_Hourly", "WorkBuddyUnlockV6_Logon"]
 
 SNAP_PREFIX = "提示词快照-"
 
@@ -1086,9 +1139,16 @@ class WorkBuddyTarget:
 
     # ---------------- 安装目录 ----------------
     def pick_title(self):
+        if IS_MAC:
+            return "选择 WorkBuddy 的安装位置（通常是 /Applications/WorkBuddy.app）"
         return "选择 WorkBuddy 的安装目录（那一层里应该有 WorkBuddy.exe）"
 
     def pick_hint(self):
+        if IS_MAC:
+            for d in ("/Applications", os.path.join(os.path.expanduser("~"), "Applications")):
+                if os.path.isdir(d):
+                    return d
+            return os.path.expanduser("~")
         la = os.environ.get("LOCALAPPDATA", "")
         if la and os.path.isdir(os.path.join(la, "Programs")):
             return os.path.join(la, "Programs")
@@ -1097,7 +1157,7 @@ class WorkBuddyTarget:
     def resolve_pick(self, path):
         """把用户点选的目录解析成 WorkBuddy 安装根。返回 (目录, 出错说明)。"""
         p = os.path.normpath(path)
-        if os.path.exists(os.path.join(p, TPL_PROBE)):
+        if os.path.exists(_tpl_probe_path(p)):
             return p, ""
         # 用户可能选深了（比如选到 resources\templates），一路往上找到安装根为止
         cur = p
@@ -1106,8 +1166,11 @@ class WorkBuddyTarget:
             if not parent or parent == cur:
                 break
             cur = parent
-            if os.path.exists(os.path.join(cur, TPL_PROBE)):
+            if os.path.exists(_tpl_probe_path(cur)):
                 return cur, ""
+        if IS_MAC:
+            return "", ("这里没找到 Contents/Resources/app.asar.unpacked/resources/templates/workbuddy-prompt.tpl。"
+                        "要选 WorkBuddy.app（通常在 /Applications 下）。")
         return "", ("这里没找到 resources\\app.asar.unpacked\\resources\\templates\\workbuddy-prompt.tpl。"
                     "要选 WorkBuddy 的安装根目录（那一层里有 WorkBuddy.exe）。")
 
@@ -1119,7 +1182,7 @@ class WorkBuddyTarget:
 
     def resolve_install_dir(self, explicit=""):
         def ok(d):
-            return bool(d) and os.path.exists(os.path.join(d, TPL_PROBE))
+            return bool(d) and os.path.exists(_tpl_probe_path(d))
 
         if explicit:
             good, _note = self.resolve_pick(explicit)
@@ -1130,6 +1193,35 @@ class WorkBuddyTarget:
         if ok(manual):
             return manual
 
+        if IS_MAC:
+            # 1) 常见安装位置
+            home = os.path.expanduser("~")
+            for c in ("/Applications/WorkBuddy.app",
+                      "/Applications/WorkBuddyAI.app",
+                      os.path.join(home, "Applications", "WorkBuddy.app"),
+                      os.path.join(home, "Applications", "WorkBuddyAI.app")):
+                if ok(c):
+                    return c
+            # 2) 进程反查：从命令行里抠出 .../WorkBuddy.app（含 Helper 子进程的父 bundle）
+            for _pid, _name, cmd in list_processes():
+                if not cmd:
+                    continue
+                m = re.search(r'(/[^"]*?/WorkBuddy(?:AI)?\.app)\b', cmd, re.I)
+                if m and ok(m.group(1)):
+                    return m.group(1)
+            # 3) mdfind（Spotlight）兜底 —— 比遍历 / 快得多
+            for q in ("kMDItemFSName == 'WorkBuddy.app'", "kMDItemFSName == 'WorkBuddyAI.app'"):
+                try:
+                    out = subprocess.run(["mdfind", q], capture_output=True, timeout=20).stdout or b""
+                    for ln in out.decode("utf-8", "replace").splitlines():
+                        ln = ln.strip()
+                        if ln and ok(ln):
+                            return ln
+                except Exception:
+                    pass
+            return ""
+
+        # ---- Windows 分支 ----
         # 1) 环境变量 / 常见位置
         la = os.environ.get("LOCALAPPDATA", "")
         if la:
@@ -1226,8 +1318,9 @@ class WorkBuddyTarget:
         cands = set()
         scan = []
         if install:
-            scan.append(os.path.join(install, "resources", "app.asar.unpacked", "resources"))
-            scan.append(os.path.join(install, "resources", "app.asar.unpacked", "cli"))
+            ar = _app_root(install)
+            scan.append(os.path.join(ar, "app.asar.unpacked", "resources"))
+            scan.append(os.path.join(ar, "app.asar.unpacked", "cli"))
         if data_dir:
             scan.append(os.path.join(data_dir, "plugins"))
         for d in scan:
@@ -1240,7 +1333,7 @@ class WorkBuddyTarget:
                     if fn.endswith(".tpl") and not fn.endswith(BAK_WB):
                         cands.add(os.path.join(root, fn))
         if install:
-            p = os.path.join(install, "resources", "app.asar.unpacked", "cli", "product.json")
+            p = os.path.join(_app_root(install), "app.asar.unpacked", "cli", "product.json")
             if os.path.exists(p):
                 cands.add(p)
         if data_dir:
@@ -1264,7 +1357,7 @@ class WorkBuddyTarget:
         if not install:
             return out
         for fn in ("codebuddy.js", "codebuddy-headless.js"):
-            p = os.path.join(install, "resources", "app.asar.unpacked", "cli", "dist", fn)
+            p = os.path.join(_app_root(install), "app.asar.unpacked", "cli", "dist", fn)
             if os.path.exists(p):
                 out.append(p)
         return out
@@ -1444,6 +1537,17 @@ class WorkBuddyTarget:
     # ---------------- 计划任务 ----------------
     @staticmethod
     def _task_exists(name):
+        if IS_MAC:
+            # launchd：plist 落盘 + 已 load 才算"存在"
+            p = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", name + ".plist")
+            if not os.path.exists(p):
+                return False
+            try:
+                r = subprocess.run(["launchctl", "list", name],
+                                   capture_output=True, timeout=20)
+                return r.returncode == 0
+            except Exception:
+                return False
         try:
             # 列表形式执行，不经 shell：任务名只来自本脚本内的常量，不接受外部输入
             r = subprocess.run(["schtasks", "/Query", "/TN", name],
@@ -1454,6 +1558,27 @@ class WorkBuddyTarget:
 
     @staticmethod
     def task_command(name):
+        if IS_MAC:
+            # 解析 plist：优先 ProgramArguments（标准写法），兼容旧版的 Program 键
+            p = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", name + ".plist")
+            try:
+                raw = read_text_safe(p) or ""
+                if not raw:
+                    return ""
+                parts = []
+                if "ProgramArguments" in raw:
+                    seg = raw[raw.find("ProgramArguments"):]
+                    # 截到 </array> 为止，避免吃到后面的 StandardOutPath
+                    end = seg.find("</array>")
+                    seg = seg[:end] if end > 0 else seg
+                    parts = [a.strip() for a in re.findall(r"<string>(.*?)</string>", seg, re.S)]
+                if not parts:
+                    prog = re.search(r"<key>Program</key>\s*<string>(.*?)</string>", raw, re.S)
+                    if prog:
+                        parts.append(prog.group(1).strip())
+                return " ".join(parts)
+            except Exception:
+                return ""
         try:
             r = subprocess.run(["schtasks", "/Query", "/TN", name, "/XML"],
                                capture_output=True, timeout=60)
@@ -1477,18 +1602,21 @@ class WorkBuddyTarget:
 
     @staticmethod
     def task_wellformed(name):
-        """计划任务的结构是否**真能跑起来**（返回 (ok, 说明)）。
-
-        v7.4 新增。踩过的坑：本机 `WorkBuddyUnlockV6_Hourly` 的 XML 长得像这样 ——
-
-            <Command>"C:\\...\\pythonw.exe E:\\...\\Forge.py --quiet"</Command>
-
-        整条命令行都被塞进了 `<Command>`，没有 `<Arguments>`。Windows 会把它当成
-        "一个名字里带空格的程序" 去找，结果 Last Result = -2147020576（参数错误），
-        **一次都没跑成**。而自检只做"脚本名是否出现在命令串里"的子串匹配，
-        于是照报「[正常] 守护任务」—— 工具在骗用户。
-        现在按结构判断：`<Command>` 只应该是解释器本身，脚本路径必须出现在 `<Arguments>` 里。
-        """
+        """任务定义是否**真能跑起来**（返回 (ok, 说明)）。"""
+        if IS_MAC:
+            p = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", name + ".plist")
+            try:
+                raw = read_text_safe(p) or ""
+            except Exception:
+                return False, "取不到 plist"
+            if not raw or "<dict>" not in raw:
+                return False, "plist 不存在或格式不对"
+            if "ProgramArguments" not in raw:
+                return False, "plist 缺 ProgramArguments"
+            script = os.path.basename(SELF)
+            if script.lower() not in raw.lower():
+                return False, "任务命令没指向本脚本"
+            return True, ""
         try:
             r = subprocess.run(["schtasks", "/Query", "/TN", name, "/XML"],
                                capture_output=True, timeout=60)
@@ -1528,7 +1656,19 @@ class WorkBuddyTarget:
 
     @staticmethod
     def task_last_result(name):
-        """任务上次运行结果（取不到返回 None）。267009=正在运行，267011=还没跑过。"""
+        """任务上次运行结果（取不到返回 None）。Windows: 267009=正在运行，267011=还没跑过。"""
+        if IS_MAC:
+            # launchctl list <label> 输出里含 "last exit code = N"
+            try:
+                r = subprocess.run(["launchctl", "list", name],
+                                   capture_output=True, timeout=20)
+                out = (r.stdout or b"").decode("utf-8", "replace")
+                m = re.search(r"last exit code\s*=\s*(-?\d+)", out, re.I)
+                if m:
+                    return int(m.group(1))
+                return None
+            except Exception:
+                return None
         try:
             r = subprocess.run(["schtasks", "/Query", "/TN", name, "/V", "/FO", "LIST"],
                                capture_output=True, timeout=60)
@@ -1565,16 +1705,32 @@ class WorkBuddyTarget:
         for name in ALL_TASKS:
             if not self._task_exists(name):
                 continue
-            _run(["schtasks", "/Delete", "/TN", name, "/F"])   # 列表形式：任务名不会被引号污染
-            if self._task_exists(name):
-                failed.append(name)
+            if IS_MAC:
+                p = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents", name + ".plist")
+                _run(["launchctl", "unload", p], timeout=20)
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+                if self._task_exists(name):
+                    failed.append(name)
+                else:
+                    removed += 1
             else:
-                removed += 1
+                _run(["schtasks", "/Delete", "/TN", name, "/F"])   # 列表形式：任务名不会被引号污染
+                if self._task_exists(name):
+                    failed.append(name)
+                else:
+                    removed += 1
         return removed, failed
 
     @staticmethod
     def _pick_quiet_python():
         exe = sys.executable
+        if IS_MAC:
+            # mac 没有 pythonw 概念；LaunchAgent 跑 python3 不会弹控制台窗口
+            return exe
         d, base = os.path.split(exe)
         if base.lower().startswith("pythonw"):
             return exe
@@ -1583,6 +1739,61 @@ class WorkBuddyTarget:
 
     def install_guard_tasks(self, admin):
         py = self._pick_quiet_python()
+        if IS_MAC:
+            la_dir = os.path.join(os.path.expanduser("~"), "Library", "LaunchAgents")
+            try:
+                os.makedirs(la_dir, exist_ok=True)
+            except Exception as e:
+                return {"hourly": False, "logon": False, "admin": admin, "python": py,
+                        "points_here": False, "wellformed": False,
+                        "wellformed_msg": "建 LaunchAgents 目录失败：%s" % e,
+                        "cmd": "", "msg_hourly": "", "msg_logon": "", "rc": (-1, -1)}
+            def _plist(label, run_at_load, start_interval):
+                # launchd 经典写法：只用 ProgramArguments（[0]=解释器，[1]=脚本，[2]=参数），
+                # 不单独设 Program 键 —— 同时设 Program + ProgramArguments 在某些 launchd
+                # 版本上会把 ProgramArguments 直接当 argv[1:]，导致 --quiet 传给解释器报错。
+                args_xml = "".join("<string>%s</string>" % _xml_escape(a)
+                                   for a in (py, SELF, "--quiet"))
+                return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+                        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+                        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+                        '<plist version="1.0">\n<dict>\n'
+                        '<key>Label</key><string>%s</string>\n'
+                        '<key>ProgramArguments</key>\n<array>%s</array>\n'
+                        % (label, args_xml)
+                        + ('<key>RunAtLoad</key><true/>\n' if run_at_load else '')
+                        + ('<key>StartInterval</key><integer>%d</integer>\n' % start_interval
+                           if start_interval else '')
+                        + '<key>StandardOutPath</key><string>/tmp/forge-guard.log</string>\n'
+                        '<key>StandardErrorPath</key><string>/tmp/forge-guard.log</string>\n'
+                        '</dict>\n</plist>\n')
+            h_path = os.path.join(la_dir, TASK_HOURLY + ".plist")
+            l_path = os.path.join(la_dir, TASK_LOGON + ".plist")
+            _m1 = _m2 = ""
+            _rc1 = _rc2 = 0
+            try:
+                write_text(h_path, _plist(TASK_HOURLY, False, 1800), make_dirs=False)
+                _m1, _rc1 = _run(["launchctl", "load", h_path], timeout=20)
+            except Exception as e:
+                _m1, _rc1 = str(e), -1
+            try:
+                write_text(l_path, _plist(TASK_LOGON, True, 0), make_dirs=False)
+                _m2, _rc2 = _run(["launchctl", "load", l_path], timeout=20)
+            except Exception as e:
+                _m2, _rc2 = str(e), -1
+            ok_h, ok_l = self._task_exists(TASK_HOURLY), self._task_exists(TASK_LOGON)
+            cmds = (self.task_command(TASK_HOURLY) + self.task_command(TASK_LOGON)).lower()
+            points_here = os.path.basename(SELF).lower() in cmds
+            wf_h, why_h = self.task_wellformed(TASK_HOURLY) if ok_h else (False, "")
+            wf_l, why_l = self.task_wellformed(TASK_LOGON) if ok_l else (False, "")
+            return {"hourly": ok_h, "logon": ok_l, "admin": admin, "python": py,
+                    "points_here": points_here,
+                    "wellformed": bool(wf_h and (wf_l or not ok_l)),
+                    "wellformed_msg": why_h or why_l,
+                    "cmd": self.task_command(TASK_HOURLY),
+                    "msg_hourly": _m1.strip(), "msg_logon": _m2.strip(),
+                    "rc": (_rc1, _rc2)}
+        # ---- Windows：schtasks ----
         # /TR 的值本身要带内层引号（路径可能有空格）；作为**单个 argv 元素**传给 schtasks，
         # 由 subprocess 在 Windows 上按 argv 规则转义，schtasks 收到的是 `"py" "脚本" --quiet`。
         tr = '"%s" "%s" --quiet' % (py, SELF)
@@ -1631,7 +1842,10 @@ class WorkBuddyTarget:
             for t, cmd, miss, why in bad:
                 if why:
                     log("  [异常] 守护任务 %s：%s" % (t, why), "red", "wb")
-                    log("         修法：以管理员身份运行 --guard install（会删掉重建）", "y", "wb")
+                    if IS_MAC:
+                        log("         修法：重新跑 --guard install（会 unload 删掉重建）", "y", "wb")
+                    else:
+                        log("         修法：以管理员身份运行 --guard install（会删掉重建）", "y", "wb")
                 else:
                     log("  [异常] 守护任务 %s 指向的不是本脚本" % t, "y", "wb")
                 log("         目标 = %s" % (cmd or "(取不到)"), "dg", "wb")
@@ -1655,7 +1869,8 @@ class WorkBuddyTarget:
         n, size = 0, 0
         cut = _dt.datetime.now() - _dt.timedelta(hours=max_age_hours)
         items = []
-        tmp = os.environ.get("TEMP", "")
+        import tempfile as _tf
+        tmp = os.environ.get("TEMP") or os.environ.get("TMPDIR") or _tf.gettempdir()
         if tmp and os.path.isdir(tmp):
             try:
                 items += [os.path.join(tmp, x) for x in os.listdir(tmp)
@@ -1987,25 +2202,41 @@ class WorkBuddyTarget:
 
         if getattr(args, "restart_wb", False) and not dry and install:
             log("正在重启 WorkBuddy...", "y", "wb")
-            _run(["taskkill", "/IM", "WorkBuddy.exe", "/F"])
-            time.sleep(3)
-            exe = None
-            for r, dirs, files in os.walk(install):
-                if "WorkBuddy.exe" in files:
-                    exe = os.path.join(r, "WorkBuddy.exe")
-                    break
-                if r.count(os.sep) - install.count(os.sep) > 2:
-                    dirs[:] = []
-            if exe:
+            if IS_MAC:
+                # mac：先优雅退出，3 秒后强杀兜底，再用 open 拉起 .app
+                _run(["osascript", "-e", 'tell application "WorkBuddy" to quit'], timeout=15)
+                time.sleep(3)
+                _run(["pkill", "-f", "WorkBuddy"], timeout=10)
+                time.sleep(1)
+                target = install if install.endswith(".app") else _exe_name()
                 try:
-                    subprocess.Popen([exe], cwd=os.path.dirname(exe))
+                    subprocess.Popen(["open", "-a", target] if not target.endswith(".app") else ["open", target])
                     log("已重新启动 WorkBuddy", "g", "wb")
                 except Exception as e:
-                    log("启动失败：%s" % e, "red", "wb")
+                    log("启动失败：%s（可手动打开 %s）" % (e, install), "red", "wb")
             else:
-                log("未找到 WorkBuddy.exe，请手动打开", "y", "wb")
+                _run(["taskkill", "/IM", "WorkBuddy.exe", "/F"])
+                time.sleep(3)
+                exe = None
+                for r, dirs, files in os.walk(install):
+                    if "WorkBuddy.exe" in files:
+                        exe = os.path.join(r, "WorkBuddy.exe")
+                        break
+                    if r.count(os.sep) - install.count(os.sep) > 2:
+                        dirs[:] = []
+                if exe:
+                    try:
+                        subprocess.Popen([exe], cwd=os.path.dirname(exe))
+                        log("已重新启动 WorkBuddy", "g", "wb")
+                    except Exception as e:
+                        log("启动失败：%s" % e, "red", "wb")
+                else:
+                    log("未找到 WorkBuddy.exe，请手动打开", "y", "wb")
         elif not dry:
-            log("请完全退出 WorkBuddy（含右下角托盘）再重开，改动才生效。", "y", "wb")
+            if IS_MAC:
+                log("请完全退出 WorkBuddy（Cmd+Q）再重开，改动才生效。", "y", "wb")
+            else:
+                log("请完全退出 WorkBuddy（含右下角托盘）再重开，改动才生效。", "y", "wb")
 
         # 护照 + 回执行：**每次 apply 都写**（v7.2 修）
         # 原来挂在 stats["fixed"] 上 —— 于是"模板全都已是最新"的那一轮就不写护照，
@@ -2140,21 +2371,30 @@ class WorkBuddyTarget:
                 continue
             rel = rel_display(t, install, data_dir)
             recs.append({"rel": rel, "size": os.path.getsize(t), "sha": sha256_file(t), "txt": txt})
-            name = rel.replace("<install>\\", "install__").replace("<data>\\", "data__").replace("\\", "__")
+            # 文件名不能含路径分隔符（\ 或 /），两种都替成 __；<install>/<data> 占位也平掉
+            name = (rel.replace("<install>", "install").replace("<data>", "data")
+                    .replace("\\", "__").replace("/", "__"))
             try:
                 shutil.copy2(t, os.path.join(tpl_dir, name))
             except Exception:
                 pass
 
-        appd = os.path.join(install, "resources", "app.asar.unpacked") if install else ""
+        appd = os.path.join(_app_root(install), "app.asar.unpacked") if install else ""
+        # 显示用的相对路径前缀：mac 是 Contents/Resources/...，Windows 是 resources\...
+        if IS_MAC:
+            _inst_prefix = "<install>/Contents/Resources/app.asar.unpacked"
+            _sep = "/"
+        else:
+            _inst_prefix = "<install>\\resources\\app.asar.unpacked"
+            _sep = "\\"
         bigs = []
-        for rel, p in (("<install>\\resources\\app.asar.unpacked\\cli\\product.json",
+        for rel, p in (("%s/cli/product.json" % _inst_prefix,
                         os.path.join(appd, "cli", "product.json")),
-                       ("<install>\\resources\\app.asar.unpacked\\cli\\dist\\codebuddy.js",
+                       ("%s/cli/dist/codebuddy.js" % _inst_prefix,
                         os.path.join(appd, "cli", "dist", "codebuddy.js")),
-                       ("<install>\\resources\\app.asar.unpacked\\cli\\dist\\codebuddy-headless.js",
+                       ("%s/cli/dist/codebuddy-headless.js" % _inst_prefix,
                         os.path.join(appd, "cli", "dist", "codebuddy-headless.js")),
-                       ("<data>\\cache\\acc-product-config-v3.json",
+                       ("<data>%scache%sacc-product-config-v3.json" % (_sep, _sep),
                         os.path.join(data_dir, "cache", "acc-product-config-v3.json"))):
             if appd and os.path.exists(p):
                 bigs.append({"rel": rel, "size": os.path.getsize(p), "sha256": sha256_file(p), "exists": True})
@@ -2198,10 +2438,13 @@ class WorkBuddyTarget:
         install, data_dir = snap.get("install_dir", ""), snap.get("data_dir", "")
 
         def real(rel):
-            if rel.startswith("<install>\\"):
-                return os.path.join(install, rel[len("<install>\\"):])
-            if rel.startswith("<data>\\"):
-                return os.path.join(data_dir, rel[len("<data>\\"):])
+            # 快照可能在 Windows 或 mac 上生成，<install> 后面跟 \ 或 / 都要认
+            for marker in ("<install>\\", "<install>/"):
+                if rel.startswith(marker):
+                    return os.path.join(install, rel[len(marker):])
+            for marker in ("<data>\\", "<data>/"):
+                if rel.startswith(marker):
+                    return os.path.join(data_dir, rel[len(marker):])
             return rel
 
         DYNAMIC = ("acc-product-config-v3.json",)
@@ -3168,8 +3411,12 @@ def _confirm_and_run(args, mode, sel):
 def _guard_menu(args):
     t = WorkBuddyTarget()
     say("")
-    say("  WorkBuddy 守护任务（每 30 分钟 + 每次登录自动重打补丁）")
-    say("  [1] 查看现状   [2] 安装/重装（需管理员）   [3] 全部卸载")
+    if IS_MAC:
+        say("  WorkBuddy 守护（launchd：每 30 分钟 + 登录时自动重打补丁）")
+        say("  [1] 查看现状   [2] 安装/重装   [3] 全部卸载")
+    else:
+        say("  WorkBuddy 守护任务（每 30 分钟 + 每次登录自动重打补丁）")
+        say("  [1] 查看现状   [2] 安装/重装（需管理员）   [3] 全部卸载")
     try:
         c = input("  选择 > ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -3181,31 +3428,38 @@ def _guard_menu(args):
         else:
             t.audit_guard_tasks(verbose=True)
     elif c == "2":
-        if not is_admin():
+        if not is_admin() and not IS_MAC:
             say("  当前不是管理员，登录守护可能装不上（每 30 分钟那个通常可以）。", "y")
         removed, failed = t.remove_guard_tasks()
         if removed:
             say("  已清理旧守护任务 %d 个" % removed, "g")
         if failed:
-            say("  有 %d 个删不掉（需管理员）：%s" % (len(failed), ", ".join(failed)), "y")
+            say("  有 %d 个删不掉：%s" % (len(failed), ", ".join(failed)), "y")
         r = t.install_guard_tasks(is_admin())
         say("  守护解释器：%s" % r["python"], "dg")
         say("  每30分钟：%s" % ("已安装" if r["hourly"] else "失败"), "g" if r["hourly"] else "red")
-        say("  每次登录：%s" % ("已安装" if r["logon"] else "未安装（需管理员）"), "g" if r["logon"] else "y")
+        if IS_MAC:
+            say("  每次登录：%s" % ("已安装" if r["logon"] else "失败"), "g" if r["logon"] else "y")
+        else:
+            say("  每次登录：%s" % ("已安装" if r["logon"] else "未安装（需管理员）"), "g" if r["logon"] else "y")
         if not r.get("wellformed", True):
             say("  [!] 任务结构不对（注册了也跑不起来）：%s" % (r.get("wellformed_msg") or ""), "red")
         if r["hourly"] and not r["points_here"]:
-            say("  [!] 任务已建但命令看起来没指向本脚本，请用管理员手动核对：", "red")
-            say("      schtasks /Query /TN \"%s\" /XML" % TASK_HOURLY, "dg")
+            if IS_MAC:
+                say("  [!] 任务已建但命令看起来没指向本脚本，手动核对：", "red")
+                say("      launchctl print gui/%d/%s" % (os.getuid(), TASK_HOURLY), "dg")
+            else:
+                say("  [!] 任务已建但命令看起来没指向本脚本，请用管理员手动核对：", "red")
+                say("      schtasks /Query /TN \"%s\" /XML" % TASK_HOURLY, "dg")
         for _k, _label in (("msg_hourly", "每30分钟"), ("msg_logon", "每次登录")):
             _msg = (r.get(_k) or "").strip()
-            if _msg and ("ERROR" in _msg.upper() or "失败" in _msg):
+            if _msg and ("ERROR" in _msg.upper() or "失败" in _msg or "Could not" in _msg):
                 say("      %s 返回：%s" % (_label, _msg.splitlines()[0][:120]), "dg")
     elif c == "3":
         removed, failed = t.remove_guard_tasks()
         say("  已删除 %d 个守护任务" % removed, "g" if removed else "")
         if failed:
-            say("  删不掉（需管理员）：%s" % ", ".join(failed), "y")
+            say("  删不掉：%s" % ", ".join(failed), "y")
 
 
 def _snap_menu(args):
@@ -3242,7 +3496,10 @@ def check_runtime():
     if sys.version_info < (3, 8):
         print("\n[运行库错误] 需要 Python 3.8 或更高版本（当前 %d.%d.%d）。"
               % (sys.version_info.major, sys.version_info.minor, sys.version_info.micro))
-        print("  下载：https://www.python.org/downloads/（安装时勾上 Add to PATH）")
+        if IS_MAC:
+            print("  macOS 安装：brew install python@3  或到 https://www.python.org/downloads/ 下载")
+        else:
+            print("  下载：https://www.python.org/downloads/（安装时勾上 Add to PATH）")
         try:
             import webbrowser
             webbrowser.open("https://www.python.org/downloads/")
@@ -3258,7 +3515,10 @@ def check_runtime():
             missing.append("%s (%r)" % (mod, e))
     if missing:
         print("[运行库错误] 标准库不完整：" + ", ".join(missing))
-        print("  请重装 Python：https://www.python.org/downloads/")
+        if IS_MAC:
+            print("  请重装 Python：brew install python@3")
+        else:
+            print("  请重装 Python：https://www.python.org/downloads/")
         sys.exit(1)
 
 
@@ -3349,7 +3609,7 @@ def main():
         if args.guard == "status":
             t.audit_guard_tasks(verbose=True)
         elif args.guard == "install":
-            if not is_admin():
+            if not is_admin() and not IS_MAC:
                 say("  当前不是管理员，登录守护可能装不上。", "y")
             removed, failed = t.remove_guard_tasks()
             if removed:
@@ -3360,16 +3620,22 @@ def main():
             if not r.get("wellformed", True):
                 say("  [!] 任务虽已注册，但结构不对（跑不起来）：%s"
                     % (r.get("wellformed_msg") or "命令格式异常"), "red")
-                say("      请用管理员身份重跑 --guard install", "y")
+                if IS_MAC:
+                    say("      重跑 --guard install（会 unload 删掉重建）", "y")
+                else:
+                    say("      请用管理员身份重跑 --guard install", "y")
             for _k, _label in (("msg_hourly", "每30分钟"), ("msg_logon", "每次登录")):
                 _msg = (r.get(_k) or "").strip()
-                if _msg and ("ERROR" in _msg.upper() or "失败" in _msg):
+                if _msg and ("ERROR" in _msg.upper() or "失败" in _msg or "Could not" in _msg):
                     say("      %s 返回：%s" % (_label, _msg.splitlines()[0][:120]), "dg")
-            if not r["logon"] and not is_admin():
+            if not r["logon"] and not is_admin() and not IS_MAC:
                 say("      登录任务需要管理员权限才能注册：右键脚本 → 以管理员身份运行，"
                     "再执行 --guard install", "dg")
             if not r["points_here"]:
-                say("  [!] 任务命令没指向本脚本，请核对：schtasks /Query /TN \"%s\" /XML" % TASK_HOURLY, "y")
+                if IS_MAC:
+                    say("  [!] 任务命令没指向本脚本，请核对：launchctl print gui/%d/%s" % (os.getuid(), TASK_HOURLY), "y")
+                else:
+                    say("  [!] 任务命令没指向本脚本，请核对：schtasks /Query /TN \"%s\" /XML" % TASK_HOURLY, "y")
         else:
             removed, failed = t.remove_guard_tasks()
             say("  已删除 %d 个守护任务" % removed, "g" if removed else "")
